@@ -1,0 +1,547 @@
+#!/bin/bash
+# macmon — macOS 资源体检：CPU / 内存 / 磁盘 / 温度降频，按应用汇总占用并给出建议
+# 用法：macmon                    体检一次
+#       macmon -w [秒]            持续刷新（默认 5 秒），Ctrl-C 退出
+#       macmon -n 数量            应用排行显示条数（默认 10）
+#       macmon startup            列出启动项（登录项 / 后台代理 / 系统守护进程）
+#       macmon startup off|on 标签  关闭 / 恢复某个启动项（launchctl disable，可随时 on 恢复）
+#       macmon apps [-d 天数]     列出应用的上次使用时间，标出超过 N 天（默认 90）没用的
+#       macmon uninstall 应用名   卸载应用：列出 .app 和 ~/Library 残留，确认后移到废纸篓
+# 体检含内置盘与外接盘/其他分区的空间；体检只读；startup off/on、uninstall 会先预览、确认后才改动。兼容系统自带 bash 3.2。
+
+# 统一用 C 区域：中文应用名和 \036 分隔符在 UTF-8 区域下会让 tr/sort 报 Illegal byte sequence
+export LC_ALL=C
+# 但 ps 在 C 区域下会把中文进程名转义成 M-dM-<… 乱码，所以 ps 单独用 UTF-8 输出，后续 awk/sort 仍按字节处理
+PS_LOCALE=en_US.UTF-8
+
+TOP_N=10
+SUBCMD=
+WATCH=0
+INTERVAL=5
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -w) WATCH=1; case "$2" in ''|-*) ;; *) INTERVAL="$2"; shift ;; esac ;;
+    -n) TOP_N="$2"; shift ;;
+    -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    startup|apps|uninstall) SUBCMD="$1"; shift; break ;;
+  esac
+  shift
+done
+
+if [ -t 1 ]; then
+  R=$'\033[31m'; Y=$'\033[33m'; G=$'\033[32m'; B=$'\033[1m'; D=$'\033[2m'; N=$'\033[0m'
+else
+  R=; Y=; G=; B=; D=; N=
+fi
+
+# 进度条：bar 百分比 宽度
+bar() {
+  local pct=$1 width=${2:-30} fill color
+  fill=$(( pct * width / 100 )); [ $fill -gt $width ] && fill=$width
+  if [ $pct -ge 85 ]; then color=$R; elif [ $pct -ge 65 ]; then color=$Y; else color=$G; fi
+  printf '%s' "$color"; printf '%*s' $fill '' | tr ' ' '#'
+  printf '%s' "$D";     printf '%*s' $((width - fill)) '' | tr ' ' '.'
+  printf '%s' "$N"
+}
+
+section() { printf '\n%s== %s ==%s\n' "$B" "$1" "$N"; }
+
+report() {
+  SUGGEST=""
+  # 级别(1 严重 2 注意 3 提示)|文字；多行文字先把换行换成 \036，排序后再还原
+  add() { SUGGEST="${SUGGEST}$1|$(printf '%s' "$2" | tr '\n' '\036')
+"; }
+
+  local ncpu mem_bytes mem_gb
+  ncpu=$(sysctl -n hw.ncpu)
+  mem_bytes=$(sysctl -n hw.memsize)
+  mem_gb=$(( mem_bytes / 1073741824 ))
+
+  printf '%s macmon  %s%s   %s  |  %s 核 / %s GB  |  开机 %s\n' \
+    "$B" "$(date '+%F %T')" "$N" "$(sw_vers -productVersion 2>/dev/null | sed 's/^/macOS /')" \
+    "$ncpu" "$mem_gb" "$(uptime | sed -E 's/.*up +([^,]+(, *[0-9]+:[0-9]+)?),.*/\1/')"
+
+  # ---------- CPU ----------
+  section "CPU"
+  local cpu_line user sys idle busy load1 load5 load15
+  # top 第二次采样才准确
+  cpu_line=$(top -l 2 -n 0 -s 1 | grep '^CPU usage' | tail -1)
+  user=$(echo "$cpu_line" | awk '{gsub("%","",$3); print int($3)}')
+  sys=$(echo "$cpu_line"  | awk '{gsub("%","",$5); print int($5)}')
+  idle=$(echo "$cpu_line" | awk '{gsub("%","",$7); print int($7)}')
+  busy=$(( 100 - idle ))
+  read -r load1 load5 load15 <<EOF
+$(sysctl -n vm.loadavg | awk '{print $2, $3, $4}')
+EOF
+  printf '使用率 %3d%% [%s]  用户 %d%% 系统 %d%%\n' "$busy" "$(bar $busy)" "$user" "$sys"
+  printf '负载   %s / %s / %s  %s(1/5/15 分钟，%s 核，超过核数即排队)%s\n' "$load1" "$load5" "$load15" "$D" "$ncpu" "$N"
+  if awk -v l="$load5" -v c="$ncpu" 'BEGIN{exit !(l > c*1.5)}'; then
+    add 1 "5 分钟负载 $load5 远超 $ncpu 核：进程在排队等 CPU，卡顿主要来自 CPU 不够用"
+  elif awk -v l="$load5" -v c="$ncpu" 'BEGIN{exit !(l > c)}'; then
+    add 2 "5 分钟负载 $load5 略超核数 $ncpu，CPU 比较吃紧"
+  fi
+
+  # ---------- 温度 / 降频 ----------
+  local therm speed sched
+  therm=$(pmset -g therm 2>/dev/null)
+  speed=$(echo "$therm" | awk -F'= *' '/CPU_Speed_Limit/{print $2+0}' | tail -1)
+  sched=$(echo "$therm" | awk -F'= *' '/CPU_Scheduler_Limit/{print $2+0}' | tail -1)
+  if [ -n "$speed" ]; then
+    printf '降频   CPU 频率上限 %s%% ' "$speed"
+    if [ "$speed" -lt 100 ]; then
+      printf '%s(过热/供电降频中)%s\n' "$R" "$N"
+      if [ "$speed" -lt 60 ]; then
+        add 1 "CPU 被限制在 ${speed}% 频率（过热降频），这是卡顿的头号原因：再多空闲内存也救不回来"
+      else
+        add 2 "CPU 有轻度降频（${speed}%）"
+      fi
+      add 3 "降温：垫高底座/远离软垫、清理风扇出风口灰尘、用原装功率足够的充电器（Intel 机型左侧口充电更凉快）、减少外接高分屏"
+    else
+      printf '%s(正常)%s\n' "$G" "$N"
+    fi
+  else
+    printf '降频   %s未记录降频事件%s\n' "$G" "$N"
+  fi
+  [ -n "$sched" ] && [ "$sched" -lt 100 ] && add 1 "CPU 调度上限被压到 ${sched}%（系统主动限制可用核心）"
+
+  # ---------- 内存 ----------
+  section "内存"
+  local vm page wired active compressed free_pct swap_used swap_total used_pct
+  vm=$(vm_stat)
+  page=$(echo "$vm" | awk '/page size of/{print $8}')
+  wired=$(echo "$vm"      | awk -v p="$page" '/Pages wired down/{gsub("\\.","",$4); printf "%.1f", $4*p/1073741824}')
+  active=$(echo "$vm"     | awk -v p="$page" '/Pages active/{gsub("\\.","",$3); printf "%.1f", $3*p/1073741824}')
+  compressed=$(echo "$vm" | awk -v p="$page" '/occupied by compressor/{gsub("\\.","",$5); printf "%.1f", $5*p/1073741824}')
+  free_pct=$(memory_pressure -Q 2>/dev/null | awk -F': *' '/free percentage/{gsub("%","",$2); print $2+0}')
+  [ -z "$free_pct" ] && free_pct=50
+  used_pct=$(( 100 - free_pct ))
+  swap_used=$(sysctl -n vm.swapusage | awk '{gsub("M","",$6); printf "%.1f", $6/1024}')
+  swap_total=$(sysctl -n vm.swapusage | awk '{gsub("M","",$3); printf "%.1f", $3/1024}')
+  printf '压力   %3d%% [%s]  %s(系统可用 %d%%)%s\n' "$used_pct" "$(bar $used_pct)" "$D" "$free_pct" "$N"
+  printf '活跃 %s GB · 系统固定(wired) %s GB · 已压缩 %s GB · 交换 %s / %s GB\n' "$active" "$wired" "$compressed" "$swap_used" "$swap_total"
+  if [ "$free_pct" -lt 15 ]; then
+    add 1 "内存压力高（可用仅 ${free_pct}%），系统在频繁压缩/换页，关掉下面排行里吃内存的应用最有效"
+  elif [ "$free_pct" -lt 30 ]; then
+    add 2 "内存偏紧（可用 ${free_pct}%）"
+  fi
+  if awk -v s="$swap_used" 'BEGIN{exit !(s >= 4)}'; then
+    add 2 "交换区已用 ${swap_used} GB：之前内存吃紧过，被换出的应用切回来时会卡一下；关掉大户或重启可清空"
+  fi
+  if awk -v c="$compressed" -v m="$mem_gb" 'BEGIN{exit !(c > m*0.25)}'; then
+    add 2 "压缩内存 ${compressed} GB 占总内存 1/4 以上，CPU 在额外做压缩解压"
+  fi
+
+  # ---------- 磁盘 ----------
+  section "磁盘"
+  local dline dsize davail dpct
+  dline=$(df -k /System/Volumes/Data 2>/dev/null | tail -1)
+  [ -z "$dline" ] && dline=$(df -k / | tail -1)
+  dsize=$(echo "$dline"  | awk '{printf "%.0f", $2/1048576}')
+  davail=$(echo "$dline" | awk '{printf "%.0f", $4/1048576}')
+  dpct=$(( 100 - davail * 100 / dsize ))
+  printf '空间   %3d%% [%s]  剩余 %s GB / %s GB\n' "$dpct" "$(bar $dpct)" "$davail" "$dsize"
+  if [ "$davail" -lt 20 ] || [ "$dpct" -ge 90 ]; then
+    add 1 "磁盘只剩 ${davail} GB：SSD 快满时写入变慢、交换区无处可放，建议至少留 15% (~$((dsize * 15 / 100)) GB)"
+    add 3 "清理方向：Rust 项目 target/ 目录（cargo clean 或 cargo install cargo-sweep）、~/Library/Caches、Docker/OrbStack 镜像、Xcode DerivedData；用「关于本机 → 存储空间」查看大头"
+    local tsize
+    tsize=$(find "$HOME/RustProjects" -maxdepth 3 -type d -name target -prune 2>/dev/null \
+            | xargs -I{} du -sk {} 2>/dev/null | sort -rn | head -5 \
+            | awk '{printf "      %6.1f GB  %s\n", $1/1048576, $2}')
+    [ -n "$tsize" ] && add 3 "最大的几个 Rust target/ 目录：
+$tsize"
+  elif [ "$dpct" -ge 80 ]; then
+    add 2 "磁盘已用 ${dpct}%，剩余 ${davail} GB，注意清理"
+  fi
+
+  # 其他磁盘（外接盘 / 双系统分区等）：同一 APFS 容器里的多个卷共用空间，按容器合并成一行
+  local main_dev other
+  main_dev=$(df -k /System/Volumes/Data 2>/dev/null | awk 'NR==2{sub(/s[0-9]+$/,"",$1); print $1}')
+  other=$(LC_ALL=$PS_LOCALE df -kl 2>/dev/null | awk -v main="$main_dev" '
+    NR==1 || $1 !~ /^\/dev\/disk/ {next}
+    {
+      mnt=$0; sub(/^[^\/]*\/dev\/disk[^ ]+ +[0-9]+ +[0-9]+ +[0-9]+ +[0-9]+% +[0-9]+ +[0-9]+ +[0-9]+% +/, "", mnt)
+      if (mnt ~ /^\/($|System\/)/) next
+      dev=$1; sub(/s[0-9]+$/,"",dev)
+      if (dev==main) next
+      name=mnt; sub(/^.*\//,"",name)
+      if (!(dev in size)) { order[++n]=dev; size[dev]=$2; avail[dev]=$4 }
+      names[dev]=(dev in names) ? names[dev] "、" name : name
+    }
+    END { for (i=1;i<=n;i++) { d=order[i]; printf "%s\t%d\t%d\t%s\n", d, size[d], avail[d], names[d] } }')
+  if [ -n "$other" ]; then
+    local odev osize oavail onames osz oav opct
+    printf '%s其他磁盘%s\n' "$D" "$N"
+    while IFS=$'\t' read -r odev osize oavail onames; do
+      osz=$(( osize / 1048576 )); oav=$(( oavail / 1048576 ))
+      [ "$osz" -le 0 ] && continue
+      opct=$(( 100 - oavail * 100 / osize ))
+      printf '空间   %3d%% [%s]  剩余 %s GB / %s GB  %s%s%s\n' "$opct" "$(bar $opct)" "$oav" "$osz" "$D" "$onames" "$N"
+      if [ "$oav" -lt 20 ] || [ "$opct" -ge 90 ]; then
+        add 2 "磁盘「${onames}」只剩 ${oav} GB（已用 ${opct}%）"
+      fi
+    done <<EOF4
+$other
+EOF4
+  fi
+
+  # ---------- 按应用汇总 ----------
+  section "应用占用排行（同一应用的 Helper/子进程已合并）"
+  # comm 是可执行文件全路径；取最外层 .app 名作为应用名，其余取可执行文件名
+  local apps
+  apps=$(LC_ALL=$PS_LOCALE ps -axo rss=,pcpu=,comm= | awk '
+    {
+      rss=$1; cpu=$2; $1=""; $2=""; sub(/^  */,""); path=$0
+      if (match(path, /[^\/]+\.app\//)) name=substr(path, RSTART, RLENGTH-5)
+      else { n=split(path, a, "/"); name=a[n] }
+      mem[name]+=rss; c[name]+=cpu; cnt[name]++
+    }
+    END { for (k in mem) printf "%.1f\t%.0f\t%d\t%s\n", c[k], mem[k]/1024, cnt[k], k }')
+
+  printf '%s%-6s %8s %5s  %s%s\n' "$D" "CPU%" "内存MB" "进程" "应用" "$N"
+  echo "$apps" | sort -t$'\t' -k1,1nr | head -"$TOP_N" | awk -F'\t' '{printf "%-6s %8s %5s  %s\n", $1, $2, $3, $4}'
+  printf '%s—— 按内存 ——%s\n' "$D" "$N"
+  echo "$apps" | sort -t$'\t' -k2,2nr | head -"$TOP_N" | awk -F'\t' '{printf "%-6s %8s %5s  %s\n", $1, $2, $3, $4}'
+
+  # ---------- 针对具体进程的建议 ----------
+  local line cpu memmb name
+  while IFS=$'\t' read -r cpu memmb _ name; do
+    [ -z "$name" ] && continue
+    local hot=0 fat=0
+    awk -v c="$cpu" 'BEGIN{exit !(c >= 50)}' && hot=1
+    [ "$memmb" -ge 3000 ] && fat=1
+    [ $hot -eq 0 ] && [ $fat -eq 0 ] && continue
+    local what="${name}（CPU ${cpu}%，内存 ${memmb} MB）"
+    case "$name" in
+      kernel_task)
+        [ $hot -eq 1 ] && add 1 "$what：kernel_task 高 CPU 通常是系统在「占住 CPU」给机器降温，根因是过热，参考上面的降温建议" ;;
+      WindowServer)
+        [ $hot -eq 1 ] && add 2 "$what：窗口合成负载高，常见于外接 4K/多显示器、开着很多窗口、透明/动画效果；可在「辅助功能 → 显示」开启降低透明度、减弱动态效果" ;;
+      mds|mds_stores|mdworker|mdworker_shared|corespotlightd)
+        add 2 "$what：Spotlight 在建索引，通常几十分钟后结束；可在「Spotlight → 隐私」排除 target/、node_modules 等大目录" ;;
+      photoanalysisd|photolibraryd|mediaanalysisd)
+        add 3 "$what：照片在做人脸/场景分析，插电且空闲时会自动跑完" ;;
+      bird|cloudd|fileproviderd)
+        add 2 "$what：iCloud 正在同步，大量文件变动时会持续占用；别把代码目录放在 iCloud 桌面/文稿里" ;;
+      backupd|backupd-helper)
+        add 3 "$what：Time Machine 正在备份，可等它结束或在菜单栏暂停" ;;
+      softwareupdated|installd|mobileassetd)
+        add 3 "$what：系统在下载/安装更新" ;;
+      syspolicyd|XProtect*|trustd|amfid)
+        add 3 "$what：系统在做安全校验，编译大量二进制时常见（可把终端加入「隐私 → 开发者工具」减少校验）" ;;
+      rustc|cargo|rust-analyzer*|clippy-driver|ld|ld64|clang)
+        add 2 "$what：编译/代码分析中。编译时卡是正常的；可用 CARGO_BUILD_JOBS=4 给系统留余量，或关掉不用的项目窗口让 rust-analyzer 停下" ;;
+      node|bun|deno)
+        add 2 "$what：Node 进程占用较高，检查是否有遗忘的 dev server / watch 进程（ps -axo pid,etime,command | grep node）" ;;
+      java|idea|pycharm|webstorm|clion)
+        add 2 "$what：JVM/IDE 占用高，关掉不用的项目，或在 IDE 里调小堆内存" ;;
+      *Docker*|com.docker*|qemu*|OrbStack*|*hyperkit*|*vfkit*)
+        add 2 "$what：容器虚拟机占用，不用时退出，或在设置里调低分配的 CPU/内存" ;;
+      "Google Chrome"*|"Microsoft Edge"*|Chromium|Arc|Brave*)
+        add 2 "$what：浏览器标签页太多，用浏览器自带的任务管理器（Chrome: ⇧Esc）找出耗资源的标签关掉" ;;
+      Safari|com.apple.WebKit*)
+        add 2 "$what：Safari 标签页/网页进程占用高，关掉不用的标签" ;;
+      Feishu|Lark|"Lark"*|WeChat|微信|DingTalk|钉钉|Slack|Discord|"Microsoft Teams"*|QQ)
+        add 2 "$what：聊天应用（Electron/内嵌浏览器）占用高，长时间不重启会越来越大，退出重开可释放" ;;
+      "Visual Studio Code"|Code*|Cursor|Electron)
+        add 2 "$what：编辑器占用高，检查扩展（命令面板 → Show Running Extensions）或关掉多余窗口" ;;
+      claude)
+        [ $fat -eq 1 ] && add 3 "$what：Claude Code 会话，长会话结束后可退出释放" ;;
+      *)
+        [ $hot -eq 1 ] && add 2 "$what：CPU 占用高，如非正在使用可退出"
+        [ $hot -eq 0 ] && [ $fat -eq 1 ] && add 3 "$what：内存大户，如非正在使用可退出" ;;
+    esac
+  done <<EOF
+$(echo "$apps" | sort -t$'\t' -k2,2nr)
+EOF
+
+  # 单进程 CPU 失控（持续 90%+ 且非编译器）
+  local runaway
+  runaway=$(LC_ALL=$PS_LOCALE ps -axo pid=,pcpu=,etime=,comm= | awk '$2>=90 {n=split($4,a,"/"); printf "PID %s %s（%s%%，已运行 %s）\n", $1, a[n], $2, $3}' | head -3)
+  [ -n "$runaway" ] && add 2 "单个进程接近吃满一个核：
+$(echo "$runaway" | sed 's/^/      /')
+      确认无用可 kill <PID>"
+
+  # 开机太久
+  local boot now days
+  boot=$(sysctl -n kern.boottime | awk -F'[ ,]' '{print $4}')
+  now=$(date +%s)
+  days=$(( (now - boot) / 86400 ))
+  [ "$days" -ge 7 ] && add 2 "已连续开机 ${days} 天，重启可清掉交换区、内存碎片和泄漏的后台进程"
+
+  # ---------- 建议汇总 ----------
+  section "诊断与建议"
+  if [ -z "$SUGGEST" ]; then
+    printf '%s未发现明显瓶颈。%s如果仍卡，留意是否某个应用自身卡顿（活动监视器里看「未响应」）\n' "$G" "$N"
+  else
+    printf '%s' "$SUGGEST" | sort -t'|' -k1,1 -s | while IFS='|' read -r lvl text; do
+      [ -z "$lvl" ] && continue
+      text=$(printf '%s' "$text" | tr '\036' '\n')
+      case "$lvl" in
+        1) printf '%s[严重]%s %s\n' "$R" "$N" "$text" ;;
+        2) printf '%s[注意]%s %s\n' "$Y" "$N" "$text" ;;
+        3) printf '%s[提示]%s %s\n' "$D" "$N" "$text" ;;
+      esac
+    done
+  fi
+}
+
+# ======================= 子命令：启动项 / 久未使用应用 / 卸载 =======================
+
+# 确认提示：confirm "问题"，非交互终端一律视为 No
+confirm() {
+  [ -t 0 ] || { printf '%s非交互环境，未执行%s\n' "$Y" "$N"; return 1; }
+  local ans; printf '%s [y/N] ' "$1"; read -r ans
+  case "$ans" in y|Y|yes) return 0 ;; *) return 1 ;; esac
+}
+
+# 路径 → "12.3 MB" 之类
+human_kb() {
+  awk -v k="$1" 'BEGIN{ if (k>=1048576) printf "%.1f GB", k/1048576; else if (k>=1024) printf "%.0f MB", k/1024; else printf "%d KB", k }'
+}
+
+# 扫描 launchd 启动项，输出 TSV：范围<TAB>标签<TAB>程序<TAB>plist 路径
+# 范围：user=~/Library/LaunchAgents，agent=/Library/LaunchAgents，daemon=/Library/LaunchDaemons
+startup_scan() {
+  local scope dir f label prog
+  for scope in "user:$HOME/Library/LaunchAgents" "agent:/Library/LaunchAgents" "daemon:/Library/LaunchDaemons"; do
+    dir=${scope#*:}; scope=${scope%%:*}
+    for f in "$dir"/*.plist; do
+      [ -e "$f" ] || continue
+      label=$(plutil -extract Label raw -o - "$f" 2>/dev/null) || continue
+      case "$label" in com.apple.*) continue ;; esac
+      prog=$(plutil -extract ProgramArguments.0 raw -o - "$f" 2>/dev/null)
+      [ -z "$prog" ] && prog=$(plutil -extract Program raw -o - "$f" 2>/dev/null)
+      printf '%s\t%s\t%s\t%s\n' "$scope" "$label" "$prog" "$f"
+    done
+  done
+}
+
+# launchctl print-disabled 的结果归一成 "标签 disabled" 行（新旧系统分别输出 disabled/true）
+disabled_labels() {
+  launchctl print-disabled "$1" 2>/dev/null \
+    | awk -F'"' '/=> (disabled|true)/{print $2}'
+}
+
+cmd_startup() {
+  local uid; uid=$(id -u)
+  case "$1" in
+    off|on) startup_toggle "$1" "$2"; return $? ;;
+    '') ;;
+    *) echo "用法：macmon startup [off|on 标签]"; return 1 ;;
+  esac
+
+  local dis_user dis_sys running_user
+  dis_user=$(disabled_labels "gui/$uid"); dis_sys=$(disabled_labels system)
+  running_user=$(launchctl list 2>/dev/null | awk '$1!="-"{print $3}')
+
+  section "启动项（launchd 代理 / 守护进程，开机或登录时自动拉起）"
+  printf '%s%-8s %-7s %s%s\n' "$D" "状态" "类型" "标签  →  程序" "$N"
+  local scope label prog plist st kind color tag
+  startup_scan | while IFS=$'\t' read -r scope label prog plist; do
+    case "$scope" in
+      user)   kind="用户代理"; tag=$dis_user ;;
+      agent)  kind="全局代理"; tag=$dis_user ;;
+      daemon) kind="系统守护"; tag=$dis_sys ;;
+    esac
+    if printf '%s\n' "$tag" | grep -Fxq "$label"; then
+      st="已禁用"; color=$D
+    elif [ "$scope" = daemon ]; then
+      if launchctl print "system/$label" 2>/dev/null | grep -Eq '^[[:space:]]*pid = '; then st="运行中"; color=$G; else st="已加载"; color=$Y; fi
+    elif printf '%s\n' "$running_user" | grep -Fxq "$label"; then
+      st="运行中"; color=$G
+    else
+      st="已加载"; color=$Y
+    fi
+    [ -n "$prog" ] && [ ! -e "$prog" ] && st="目标丢失" && color=$R
+    printf '%s%-8s%s %-7s %s  →  %s%s%s\n' "$color" "$st" "$N" "$kind" "$label" "$D" "${prog:-?}" "$N"
+  done
+
+  # 「登录项」(SMAppService)：只列出，关闭要去系统设置，命令行没有可靠的关闭办法
+  section "登录项（App 自带，在 系统设置 → 通用 → 登录项与扩展 里关闭）"
+  sfltool dumpbtm 2>/dev/null | awk '
+    /^ +Name:/        {sub(/^ +Name: */,""); name=$0}
+    /^ +Type:/        {type=$0}
+    /^ +Disposition:/ {en = ($0 ~ /\[enabled/)}
+    /^ +URL:/         {sub(/^ +URL: */,""); if (en && type ~ /(login item|app) /) print "  " name "  " "'"$D"'" $0 "'"$N"'"; en=0}' \
+    | sed 's/file:\/\///; s/%\([0-9A-F][0-9A-F]\)/\\x\1/g' | grep -v '/\.Trash/' | while IFS= read -r l; do printf '%b\n' "$l"; done | sort -u
+  printf '\n%s关闭：macmon startup off <标签>　恢复：macmon startup on <标签>（只是 disable，不删文件）%s\n' "$D" "$N"
+}
+
+startup_toggle() {
+  local act=$1 target=$2 uid; uid=$(id -u)
+  [ -z "$target" ] && { echo "用法：macmon startup $act <标签>"; return 1; }
+  local hit; hit=$(startup_scan | awk -F'\t' -v t="$target" '$2==t')
+  [ -z "$hit" ] && { printf '%s没找到标签 %s%s（先用 macmon startup 看标签）\n' "$R" "$target" "$N"; return 1; }
+  local scope prog plist
+  IFS=$'\t' read -r scope _ prog plist <<EOF2
+$hit
+EOF2
+  local domain pre=""
+  if [ "$scope" = daemon ]; then domain="system"; pre="sudo "; else domain="gui/$uid"; fi
+
+  if [ "$act" = off ]; then
+    printf '将关闭启动项 %s%s%s\n  程序：%s\n  命令：%slaunchctl disable %s/%s ; %slaunchctl bootout %s/%s\n' "$B" "$target" "$N" "${prog:-?}" "$pre" "$domain" "$target" "$pre" "$domain" "$target"
+    confirm "确认关闭？" || return 1
+    $pre launchctl disable "$domain/$target" || return 1
+    $pre launchctl bootout "$domain/$target" 2>/dev/null   # 已经没在跑会报错，忽略
+    printf '%s已关闭%s（下次开机不再启动；文件原样保留）\n' "$G" "$N"
+  else
+    printf '将恢复启动项 %s\n  命令：%slaunchctl enable %s/%s\n' "$target" "$pre" "$domain" "$target"
+    confirm "确认恢复？" || return 1
+    $pre launchctl enable "$domain/$target" || return 1
+    printf '%s已恢复%s（下次登录/开机生效；要立即启动：%slaunchctl bootstrap %s %s）\n' "$G" "$N" "$pre" "$domain" "$plist"
+  fi
+}
+
+# Spotlight 日期 "2026-10-01 05:00:21 +0000" → epoch，空则输出空
+spot_epoch() {
+  case "$1" in ''|'(null)') return ;; esac
+  date -j -u -f '%Y-%m-%d %H:%M:%S' "${1% +0000}" +%s 2>/dev/null
+}
+
+# 应用上次使用时间（epoch）：取 Spotlight LastUsedDate 与 偏好/窗口状态文件修改时间中较新的；都没有则空
+app_last_used() {
+  local app=$1 bid=$2 best="" t f
+  t=$(spot_epoch "$(mdls -raw -name kMDItemLastUsedDate "$app")"); best=$t
+  for f in "$HOME/Library/Preferences/$bid.plist" \
+           "$HOME/Library/Containers/$bid/Data/Library/Preferences/$bid.plist" \
+           "$HOME/Library/Saved Application State/$bid.savedState"; do
+    [ -e "$f" ] || continue
+    t=$(stat -f %m "$f")
+    [ -z "$best" ] || [ "$t" -gt "$best" ] && best=$t
+  done
+  printf '%s' "$best"
+}
+
+cmd_apps() {
+  local days=90
+  [ "$1" = "-d" ] && [ -n "$2" ] && days=$2
+  local now; now=$(date +%s)
+
+  section "应用使用情况（超过 ${days} 天没用的标红）"
+  printf '%s估算：Spotlight「上次打开」与偏好/窗口状态文件时间取较新者；后台常驻、只用菜单栏的应用可能被低估%s\n' "$D" "$N"
+  printf '%s%6s  %-10s %9s  %s%s\n' "$D" "未用天" "上次使用" "大小" "应用" "$N"
+
+  local app bid last age lastfmt kb phys name
+  for app in /Applications/*.app "$HOME"/Applications/*.app; do
+    [ -d "$app" ] || continue
+    bid=$(mdls -raw -name kMDItemCFBundleIdentifier "$app")
+    case "$bid" in com.apple.*) continue ;; esac
+    last=$(app_last_used "$app" "$bid")
+    if [ -n "$last" ]; then
+      age=$(( (now - last) / 86400 )); lastfmt=$(date -r "$last" +%F)
+    else
+      # 完全没有使用痕迹：用添加日期，标 *
+      last=$(spot_epoch "$(mdls -raw -name kMDItemDateAdded "$app")")
+      [ -z "$last" ] && last=$(stat -f %m "$app")
+      age=$(( (now - last) / 86400 )); lastfmt="$(date -r "$last" +%F)*"
+    fi
+    phys=$(mdls -raw -name kMDItemPhysicalSize "$app")
+    case "$phys" in ''|'(null)') kb=0 ;; *) kb=$(( phys / 1024 )) ;; esac
+    name=$(basename "$app" .app)
+    printf '%s\t%s\t%s\t%s\t%s\n' "$age" "$lastfmt" "$kb" "$bid" "$name"
+  done | sort -t$'\t' -k1,1nr | awk -F'\t' -v days="$days" -v R="$R" -v N="$N" -v D="$D" '
+    {
+      kb=$3
+      if (kb==0) size="-"; else if (kb>=1048576) size=sprintf("%.1f GB", kb/1048576); else if (kb>=1024) size=sprintf("%.0f MB", kb/1024); else size=kb " KB"
+      color = ($1>=days) ? R : ""; end = ($1>=days) ? N : ""
+      if ($1>=days) { n++; tot+=kb }
+      printf "%s%6d  %-10s %9s  %s%s\n", color, $1, $2, size, $5, end
+    }
+    END {
+      printf "\n" D "* 没有任何使用痕迹，日期是安装/添加日期" N "\n"
+      if (n>0) printf "%d 个应用超过 %d 天没用，合计约 %.1f GB。卸载：macmon uninstall <应用名>\n", n, days, tot/1048576
+      else printf "没有超过 %d 天未使用的应用。\n", days
+    }'
+}
+
+cmd_uninstall() {
+  local name=$1
+  [ -z "$name" ] && { echo "用法：macmon uninstall <应用名>（支持名称片段，如 goland）"; return 1; }
+
+  # 按名称片段匹配（忽略大小写）
+  local matches="" app
+  for app in /Applications/*.app "$HOME"/Applications/*.app; do
+    [ -d "$app" ] || continue
+    printf '%s' "$(basename "$app" .app)" | grep -qi -- "$name" && matches="$matches$app
+"
+  done
+  matches=$(printf '%s' "$matches" | sed '/^$/d')
+  [ -z "$matches" ] && { printf '%s没找到匹配 "%s" 的应用%s\n' "$R" "$name" "$N"; return 1; }
+  if [ "$(printf '%s\n' "$matches" | wc -l)" -gt 1 ]; then
+    printf '匹配到多个，请换更精确的名字：\n'; printf '%s\n' "$matches" | sed 's/^/  /'; return 1
+  fi
+  app=$matches
+
+  local bid; bid=$(mdls -raw -name kMDItemCFBundleIdentifier "$app")
+  case "$bid" in com.apple.*|''|'(null)') printf '%s拒绝：%s 是系统应用或读不到 Bundle ID%s\n' "$R" "$app" "$N"; return 1 ;; esac
+  if pgrep -f "$app/Contents/MacOS/" >/dev/null 2>&1; then
+    printf '%s%s 正在运行，请先退出再卸载%s\n' "$R" "$(basename "$app")" "$N"; return 1
+  fi
+
+  # 收集要移走的东西：.app + ~/Library 里以 Bundle ID 命名的残留 + 指向该应用的用户级启动项
+  local items="" p lib="$HOME/Library"
+  items="$app
+"
+  for p in "$lib/Application Support/$bid" "$lib/Caches/$bid" "$lib/Preferences/$bid.plist" \
+           "$lib/Containers/$bid" "$lib/Saved Application State/$bid.savedState" \
+           "$lib/HTTPStorages/$bid" "$lib/WebKit/$bid" "$lib/Logs/$bid" "$lib/Cookies/$bid.binarycookies" \
+           "$lib/Application Support/$(basename "$app" .app)"; do
+    [ -e "$p" ] && items="$items$p
+"
+  done
+  for p in "$lib/Group Containers"/*"$bid"*; do [ -e "$p" ] && items="$items$p
+"; done
+  local launch_labels="" scope label prog plist sysrest=""
+  while IFS=$'\t' read -r scope label prog plist; do
+    case "$prog" in "$app"/*) ;; *) case "$label" in "$bid"*) ;; *) continue ;; esac ;; esac
+    if [ "$scope" = user ]; then items="$items$plist
+"; launch_labels="$launch_labels $label"
+    else sysrest="$sysrest  $plist
+"; fi
+  done <<EOF3
+$(startup_scan)
+EOF3
+  items=$(printf '%s' "$items" | sed '/^$/d')
+
+  printf '%s将卸载 %s%s（%s）\n将移到废纸篓：\n' "$B" "$(basename "$app")" "$N" "$bid"
+  local total=0 kb
+  printf '%s\n' "$items" | while IFS= read -r p; do
+    kb=$(du -sk "$p" 2>/dev/null | awk '{print $1}')
+    printf '  %9s  %s\n' "$(human_kb "${kb:-0}")" "$p"
+  done
+  [ -n "$sysrest" ] && printf '%s以下系统级启动项需要管理员权限，不会自动处理：\n%s%s' "$Y" "$sysrest" "$N"
+  printf '%s按 Bundle ID 精确匹配，没有模糊删除；文件放进 ~/.Trash，反悔可手动拖回。%s\n' "$D" "$N"
+
+  confirm "确认卸载？" || return 1
+
+  local l
+  for l in $launch_labels; do
+    launchctl bootout "gui/$(id -u)/$l" 2>/dev/null
+  done
+  local ts dest base fail=0; ts=$(date +%H%M%S)
+  printf '%s\n' "$items" | while IFS= read -r p; do
+    base=$(basename "$p"); dest="$HOME/.Trash/$base"
+    [ -e "$dest" ] && dest="$HOME/.Trash/$base.$ts"
+    mv "$p" "$dest" 2>/dev/null && printf '  已移走 %s\n' "$p" || printf '%s  失败（可能需要权限）：%s%s\n' "$R" "$p" "$N"
+  done
+  printf '%s完成。%s清空废纸篓后才真正释放空间。\n' "$G" "$N"
+}
+
+case "$SUBCMD" in
+  startup)   cmd_startup "$@"; exit $? ;;
+  apps)      cmd_apps "$@"; exit $? ;;
+  uninstall) cmd_uninstall "$@"; exit $? ;;
+esac
+
+if [ $WATCH -eq 1 ]; then
+  trap 'printf "%s\n" "$N"; exit 0' INT
+  while true; do
+    out=$(report)
+    clear; printf '%s\n' "$out"
+    printf '\n%s每 %s 秒刷新，Ctrl-C 退出%s\n' "$D" "$INTERVAL" "$N"
+    sleep "$INTERVAL"
+  done
+else
+  report
+fi
