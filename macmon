@@ -6,6 +6,7 @@
 #       macmon startup            列出启动项（登录项 / 后台代理 / 系统守护进程）
 #       macmon startup off|on 标签  关闭 / 恢复某个启动项（launchctl disable，可随时 on 恢复）
 #       macmon apps [-d 天数]     列出应用的上次使用时间，标出超过 N 天（默认 90）没用的
+#       macmon jobs               列出后台定时任务：触发规则 / 状态 / 崩溃循环 / 日志新旧
 #       macmon uninstall 应用名   卸载应用：列出 .app 和 ~/Library 残留，确认后移到废纸篓
 # 体检含内置盘与外接盘/其他分区的空间；体检只读；startup off/on、uninstall 会先预览、确认后才改动。兼容系统自带 bash 3.2。
 
@@ -22,8 +23,8 @@ while [ $# -gt 0 ]; do
   case "$1" in
     -w) WATCH=1; case "$2" in ''|-*) ;; *) INTERVAL="$2"; shift ;; esac ;;
     -n) TOP_N="$2"; shift ;;
-    -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    startup|apps|uninstall) SUBCMD="$1"; shift; break ;;
+    -h|--help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    startup|apps|uninstall|jobs) SUBCMD="$1"; shift; break ;;
   esac
   shift
 done
@@ -528,9 +529,149 @@ EOF3
   printf '%s完成。%s清空废纸篓后才真正释放空间。\n' "$G" "$N"
 }
 
+# ---------- jobs：后台定时任务 ----------
+
+# StartCalendarInterval 的 JSON（对象或对象数组，来自 stdin）→ "每天 08:30、每天 20:00"
+cal_text() {
+  awk '{
+    s=$0; gsub(/[\[\]]/,"",s); n=split(s, parts, "}"); out=""
+    for (i=1;i<=n;i++) {
+      p=parts[i]; if (p !~ /\{/) continue
+      h=-1; m=-1; w=-1; d=-1
+      if (match(p,/"Hour":[0-9]+/))    h=substr(p,RSTART+7,RLENGTH-7)+0
+      if (match(p,/"Minute":[0-9]+/))  m=substr(p,RSTART+9,RLENGTH-9)+0
+      if (match(p,/"Weekday":[0-9]+/)) w=substr(p,RSTART+10,RLENGTH-10)+0
+      if (match(p,/"Day":[0-9]+/))     d=substr(p,RSTART+6,RLENGTH-6)+0
+      if (d>=0)      pre="每月" d "日"
+      else if (w>=0) pre="每周" substr("日一二三四五六日", w*3+1, 3)
+      else if (h>=0) pre="每天"
+      else           pre="每小时"
+      if (h>=0) t=sprintf("%02d:%02d", h, (m<0?0:m)); else t=sprintf(":%02d", (m<0?0:m))
+      out = out (out==""?"":"、") pre " " t
+    }
+    print out
+  }'
+}
+
+# 秒数 → "5 分钟前" / "3 小时前" / "2 天前"
+age_text() {
+  awk -v s="$1" 'BEGIN{ if (s<90) printf "刚刚"; else if (s<5400) printf "%d 分钟前", s/60; else if (s<129600) printf "%d 小时前", s/3600; else printf "%d 天前", s/86400 }'
+}
+
+cmd_jobs() {
+  local uid now ll dis_user dis_sys
+  uid=$(id -u); now=$(date +%s)
+  ll=$(launchctl list 2>/dev/null)                       # 用户域：PID<TAB>退出码<TAB>标签
+  dis_user=$(disabled_labels "gui/$uid"); dis_sys=$(disabled_labels system)
+
+  # 逐项解析成 TSV：组<TAB>状态码<TAB>状态文字<TAB>规则<TAB>标签<TAB>命令<TAB>日志说明
+  # 组：1 定时 2 常驻 3 按需；状态码：0 正常 1 需要注意
+  local rows="" scope label prog plist
+  while IFS=$'\t' read -r scope label prog plist; do
+    local cal si ka grp rule dis pid code st warn=0 cmd logs log lm newest="" gap=0
+    cal=$(plutil -extract StartCalendarInterval json -o - "$plist" 2>/dev/null | cal_text)
+    si=$(plutil -extract StartInterval raw -o - "$plist" 2>/dev/null)
+    ka=$(plutil -extract KeepAlive raw -o - "$plist" 2>/dev/null | head -1)
+    [ "$ka" = false ] && ka=""
+    if [ -n "$cal" ]; then
+      grp=1; rule="$cal"
+      case "$cal" in *每小时*) gap=10800 ;; *每天*) gap=129600 ;; esac
+    elif [ -n "$si" ]; then
+      grp=1; rule="每 ${si} 秒"; gap=$(( si * 3 ))
+    elif [ -n "$ka" ]; then
+      grp=2; rule="常驻"
+    elif [ "$(plutil -extract RunAtLoad raw -o - "$plist" 2>/dev/null)" = true ]; then
+      grp=2; rule="登录/开机时运行"
+    else
+      grp=3; rule="按需"
+    fi
+
+    # 状态：用户域看 launchctl list，系统守护看 launchctl print system/…
+    pid=""; code=""
+    if [ "$scope" = daemon ]; then
+      local pr; pr=$(launchctl print "system/$label" 2>/dev/null)
+      pid=$(printf '%s\n' "$pr" | awk '/^[[:space:]]*pid = /{print $3; exit}')
+      code=$(printf '%s\n' "$pr" | sed -n 's/.*last exit code = //p' | head -1)
+      case "$code" in '(never'*) code="" ;; esac
+      printf '%s\n' "$dis_sys" | grep -Fxq "$label" && dis=1 || dis=0
+    else
+      local row; row=$(printf '%s\n' "$ll" | awk -F'\t' -v l="$label" '$3==l{print $1 "\t" $2}')
+      [ -n "$row" ] && { pid=${row%%$'\t'*}; code=${row#*$'\t'}; [ "$pid" = - ] && pid=""; }
+      printf '%s\n' "$dis_user" | grep -Fxq "$label" && dis=1 || dis=0
+      [ -z "$row" ] && [ $dis -eq 0 ] && code="未加载"
+    fi
+    local runs=""
+    if [ "$scope" != daemon ] && [ -n "$ka" ] && [ $dis -eq 0 ]; then
+      runs=$(launchctl print "gui/$uid/$label" 2>/dev/null | awk '/^[[:space:]]*runs = /{print $3; exit}')
+    fi
+    if [ $dis -eq 1 ]; then st="已禁用"
+    elif [ "$code" = "未加载" ]; then st="未加载"
+    elif [ -n "$runs" ] && [ "$runs" -ge 20 ] && [ -n "$code" ] && [ "$code" != 0 ]; then
+      st="崩溃循环：已被拉起 ${runs} 次，上次退出码 ${code}"; [ -n "$pid" ] && st="$st（此刻在跑）"; warn=1
+    elif [ -n "$pid" ]; then st="运行中"
+    elif [ -n "$code" ] && [ "$code" != 0 ] && [ -n "$ka" ]; then st="崩溃循环(退出码 $code)"; warn=1
+    elif [ -n "$code" ] && [ "$code" != 0 ] && [ "$code" != "(never exited)" ]; then st="上次失败(退出码 $code)"; warn=1
+    else st="空闲"; fi
+
+    # 命令（家目录缩写、截断）
+    cmd=$(plutil -extract ProgramArguments json -o - "$plist" 2>/dev/null | sed 's/^\[//;s/\]$//;s/","/ /g;s/"//g;s/\\\//\//g')
+    [ -z "$cmd" ] && cmd=$prog
+    cmd=$(printf '%s' "$cmd" | sed "s#$HOME#~#g" | cut -c1-90)
+
+    # 日志：取 stdout/stderr 里较新的修改时间
+    logs=$(plutil -extract StandardOutPath raw -o - "$plist" 2>/dev/null; plutil -extract StandardErrorPath raw -o - "$plist" 2>/dev/null)
+    while IFS= read -r log; do
+      [ -z "$log" ] && continue
+      lm=$(stat -f %m "$log" 2>/dev/null) || continue
+      [ -z "$newest" ] || [ "$lm" -gt "$newest" ] && newest=$lm
+    done <<EOF5
+$logs
+EOF5
+    local logtxt="未声明日志路径"
+    if [ -n "$logs" ] && [ -z "$newest" ]; then
+      logtxt="日志文件不存在"
+    elif [ -n "$newest" ]; then
+      logtxt="日志 $(age_text $(( now - newest )))更新"
+      if [ $dis -eq 0 ] && [ "$gap" -gt 0 ] && [ $(( now - newest )) -gt "$gap" ]; then
+        logtxt="$logtxt（超过 3 个周期没动，可能没跑，或日志在别处）"; warn=1
+      fi
+    fi
+    rows="$rows$grp	$warn	$st	$rule	$label	$cmd	$logtxt
+"
+  done <<EOF6
+$(startup_scan)
+EOF6
+
+  local title g
+  for g in 1 2 3; do
+    case $g in 1) title="定时任务（到点触发）" ;; 2) title="常驻 / 开机即跑" ;; 3) title="按需（被其他程序唤起）" ;; esac
+    local part; part=$(printf '%s' "$rows" | awk -F'\t' -v g=$g '$1==g')
+    [ -z "$part" ] && continue
+    section "$title"
+    printf '%s\n' "$part" | while IFS=$'\t' read -r _ warn st rule label cmd logtxt; do
+      local color=$G
+      case "$st" in 已禁用|未加载) color=$D ;; 空闲) color=$N ;; esac
+      [ "$warn" = 1 ] && color=$R
+      printf '%s%s%s  %s%s%s  %s\n' "$color" "$st" "$N" "$B" "$rule" "$N" "$label"
+      [ "$logtxt" = "未声明日志路径" ] && printf '%s   %s%s\n' "$D" "$cmd" "$N" || printf '%s   %s · %s%s\n' "$D" "$cmd" "$logtxt" "$N"
+    done
+  done
+
+  section "crontab / at"
+  local cr at
+  cr=$(crontab -l 2>/dev/null | sed '/^[[:space:]]*#/d;/^[[:space:]]*$/d')
+  at=$(atq 2>/dev/null)
+  [ -z "$cr" ] && printf 'crontab  无\n' || printf 'crontab\n%s\n' "$(printf '%s\n' "$cr" | sed 's/^/  /')"
+  [ -z "$at" ] && printf 'at       无\n' || printf 'at\n%s\n' "$(printf '%s\n' "$at" | sed 's/^/  /')"
+
+  local nwarn; nwarn=$(printf '%s' "$rows" | awk -F'\t' '$2==1' | wc -l | tr -d ' ')
+  printf '\n%s红色 = 需要留意（%s 项）。关闭：macmon startup off <标签>%s\n' "$D" "$nwarn" "$N"
+}
+
 case "$SUBCMD" in
   startup)   cmd_startup "$@"; exit $? ;;
   apps)      cmd_apps "$@"; exit $? ;;
+  jobs)      cmd_jobs; exit $? ;;
   uninstall) cmd_uninstall "$@"; exit $? ;;
 esac
 
