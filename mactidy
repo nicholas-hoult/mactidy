@@ -1,13 +1,13 @@
 #!/bin/bash
-# macmon — macOS 资源体检：CPU / 内存 / 磁盘 / 温度降频，按应用汇总占用并给出建议
-# 用法：macmon                    体检一次
-#       macmon -w [秒]            持续刷新（默认 5 秒），Ctrl-C 退出
-#       macmon -n 数量            应用排行显示条数（默认 10）
-#       macmon startup            列出启动项（登录项 / 后台代理 / 系统守护进程）
-#       macmon startup off|on 标签  关闭 / 恢复某个启动项（launchctl disable，可随时 on 恢复）
-#       macmon apps [-d 天数]     列出应用的上次使用时间，标出超过 N 天（默认 90）没用的
-#       macmon jobs               列出后台定时任务：触发规则 / 状态 / 崩溃循环 / 日志新旧
-#       macmon uninstall 应用名   卸载应用：列出 .app 和 ~/Library 残留，确认后移到废纸篓
+# mactidy — macOS 资源体检：CPU / 内存 / 磁盘 / 温度降频，按应用汇总占用并给出建议
+# 用法：mactidy                    体检一次
+#       mactidy -w [秒]            持续刷新（默认 5 秒），Ctrl-C 退出
+#       mactidy -n 数量            应用排行显示条数（默认 10）
+#       mactidy startup            列出启动项（登录项 / 后台代理 / 系统守护进程）
+#       mactidy startup off|on 标签  关闭 / 恢复某个启动项（launchctl disable，可随时 on 恢复）
+#       mactidy apps [-d 天数]     列出应用的上次使用时间，标出超过 N 天（默认 90）没用的
+#       mactidy jobs               列出后台定时任务：触发规则 / 状态 / 崩溃循环 / 日志新旧
+#       mactidy uninstall 应用名   卸载应用：列出 .app 和 ~/Library 残留，确认后移到废纸篓
 # 体检含内置盘与外接盘/其他分区的空间；体检只读；startup off/on、uninstall 会先预览、确认后才改动。兼容系统自带 bash 3.2。
 
 # 统一用 C 区域：中文应用名和 \036 分隔符在 UTF-8 区域下会让 tr/sort 报 Illegal byte sequence
@@ -58,7 +58,7 @@ report() {
   mem_bytes=$(sysctl -n hw.memsize)
   mem_gb=$(( mem_bytes / 1073741824 ))
 
-  printf '%s macmon  %s%s   %s  |  %s 核 / %s GB  |  开机 %s\n' \
+  printf '%s mactidy  %s%s   %s  |  %s 核 / %s GB  |  开机 %s\n' \
     "$B" "$(date '+%F %T')" "$N" "$(sw_vers -productVersion 2>/dev/null | sed 's/^/macOS /')" \
     "$ncpu" "$mem_gb" "$(uptime | sed -E 's/.*up +([^,]+(, *[0-9]+:[0-9]+)?),.*/\1/')"
 
@@ -328,7 +328,7 @@ cmd_startup() {
   case "$1" in
     off|on) startup_toggle "$1" "$2"; return $? ;;
     '') ;;
-    *) echo "用法：macmon startup [off|on 标签]"; return 1 ;;
+    *) echo "用法：mactidy startup [off|on 标签]"; return 1 ;;
   esac
 
   local dis_user dis_sys running_user
@@ -365,14 +365,14 @@ cmd_startup() {
     /^ +Disposition:/ {en = ($0 ~ /\[enabled/)}
     /^ +URL:/         {sub(/^ +URL: */,""); if (en && type ~ /(login item|app) /) print "  " name "  " "'"$D"'" $0 "'"$N"'"; en=0}' \
     | sed 's/file:\/\///; s/%\([0-9A-F][0-9A-F]\)/\\x\1/g' | grep -v '/\.Trash/' | while IFS= read -r l; do printf '%b\n' "$l"; done | sort -u
-  printf '\n%s关闭：macmon startup off <标签>　恢复：macmon startup on <标签>（只是 disable，不删文件）%s\n' "$D" "$N"
+  printf '\n%s关闭：mactidy startup off <标签>　恢复：mactidy startup on <标签>（只是 disable，不删文件）%s\n' "$D" "$N"
 }
 
 startup_toggle() {
   local act=$1 target=$2 uid; uid=$(id -u)
-  [ -z "$target" ] && { echo "用法：macmon startup $act <标签>"; return 1; }
+  [ -z "$target" ] && { echo "用法：mactidy startup $act <标签>"; return 1; }
   local hit; hit=$(startup_scan | awk -F'\t' -v t="$target" '$2==t')
-  [ -z "$hit" ] && { printf '%s没找到标签 %s%s（先用 macmon startup 看标签）\n' "$R" "$target" "$N"; return 1; }
+  [ -z "$hit" ] && { printf '%s没找到标签 %s%s（先用 mactidy startup 看标签）\n' "$R" "$target" "$N"; return 1; }
   local scope prog plist
   IFS=$'\t' read -r scope _ prog plist <<EOF2
 $hit
@@ -451,14 +451,14 @@ cmd_apps() {
     }
     END {
       printf "\n" D "* 没有任何使用痕迹，日期是安装/添加日期" N "\n"
-      if (n>0) printf "%d 个应用超过 %d 天没用，合计约 %.1f GB。卸载：macmon uninstall <应用名>\n", n, days, tot/1048576
+      if (n>0) printf "%d 个应用超过 %d 天没用，合计约 %.1f GB。卸载：mactidy uninstall <应用名>\n", n, days, tot/1048576
       else printf "没有超过 %d 天未使用的应用。\n", days
     }'
 }
 
 cmd_uninstall() {
   local name=$1
-  [ -z "$name" ] && { echo "用法：macmon uninstall <应用名>（支持名称片段，如 goland）"; return 1; }
+  [ -z "$name" ] && { echo "用法：mactidy uninstall <应用名>（支持名称片段，如 goland）"; return 1; }
 
   # 按名称片段匹配（忽略大小写）
   local matches="" app
@@ -665,7 +665,7 @@ EOF6
   [ -z "$at" ] && printf 'at       无\n' || printf 'at\n%s\n' "$(printf '%s\n' "$at" | sed 's/^/  /')"
 
   local nwarn; nwarn=$(printf '%s' "$rows" | awk -F'\t' '$2==1' | wc -l | tr -d ' ')
-  printf '\n%s红色 = 需要留意（%s 项）。关闭：macmon startup off <标签>%s\n' "$D" "$nwarn" "$N"
+  printf '\n%s红色 = 需要留意（%s 项）。关闭：mactidy startup off <标签>%s\n' "$D" "$nwarn" "$N"
 }
 
 case "$SUBCMD" in
